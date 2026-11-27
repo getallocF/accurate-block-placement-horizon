@@ -1,1 +1,19 @@
- 
+[package]
+name = "accurateblockplacement"
+version = "1.4.8"
+edition = "2024"
+license = "MIT"
+description = "Native Horizon port of Accurate Block Placement Reborn"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
