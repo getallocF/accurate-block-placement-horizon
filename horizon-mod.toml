@@ -1,19 +1,8 @@
-id = "accurateblockplacement"
-name = "Accurate Block Placement"
-version = "1.4.8"
-description = "Build at super speed with your bare hands!"
-authors = ["Clayborn", "Flourick", "KadTheHunter"]
-license = "MIT"
-homepage = "https://modrinth.com/mod/accurate-block-placement-reborn"
-issues = "https://github.com/KadTheHunter/AccurateBlockPlacement-Reborn/issues"
+id = "accurate_block_placement"
+name = "Accurate Block Placement Reborn"
+version = "1.0.0"
+description = "Fast block placement (0 cooldown), anti-double-placement, and Carpet protocol rotation lock for Horizon Android."
+authors = ["PortedForHorizon"]
 api = "0.2"
 side = "client"
-capabilities = ["registries"]
-
-[incompatible]
-nmc = "*"
-
-[native]
-game = "26.3"
-# Otomatis dipin ke commit Nightly Horizon terbaru oleh `cargo horizon-mod update` di CI
-horizon = "0000000000000000000000000000000000000000"
+capabilities = ["input", "client_tick", "packets", "hud", "commands", "storage"]
