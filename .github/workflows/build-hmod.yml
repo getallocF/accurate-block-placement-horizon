@@ -1,1 +1,99 @@
- 
+name: Build Horizon Mod (.hmod)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      horizon_repo:
+        description: "URL repository Git untuk cargo-horizon-mod"
+        required: false
+        default: "https://github.com/horizon-rust/horizon.git"
+      horizon_rev:
+        description: "Branch/tag/commit opsional untuk cargo-horizon-mod"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MOD_ID: accurateblockplacement
+
+jobs:
+  build-hmod:
+    name: Build & Verify accurateblockplacement.hmod
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.95+ with wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Verify Rust version >= 1.95
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo registry, git, and Horizon SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            .horizon/sdk
+            target
+          key: ${{ runner.os }}-horizon-hmod-${{ hashFiles('horizon-mod.toml', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-horizon-hmod-
+
+      - name: Install cargo-horizon-mod
+        shell: bash
+        run: |
+          if ! command -v cargo-horizon-mod >/dev/null 2>&1; then
+            REPO_URL="${{ inputs.horizon_repo || 'https://github.com/horizon-rust/horizon.git' }}"
+            REV="${{ inputs.horizon_rev }}"
+            if [ -n "$REV" ]; then
+              cargo install --locked --git "$REPO_URL" --rev "$REV" cargo-horizon-mod
+            else
+              cargo install --locked --git "$REPO_URL" cargo-horizon-mod
+            fi
+          fi
+          cargo horizon-mod --version
+
+      - name: Sync Horizon SDK & pin [native].horizon
+        run: |
+          cargo horizon-mod update
+
+      - name: Run unit tests (config & placement math)
+        run: |
+          cargo test --lib
+
+      - name: Validate manifest and mod source
+        run: |
+          cargo horizon-mod check
+
+      - name: Build native .hmod archive
+        run: |
+          cargo horizon-mod build
+
+      - name: Verify built .hmod package
+        run: |
+          test -f "target/horizon-mod/${MOD_ID}.hmod"
+          cargo horizon-mod check "target/horizon-mod/${MOD_ID}.hmod"
+
+      - name: Upload accurateblockplacement.hmod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: accurateblockplacement-hmod
+          path: target/horizon-mod/accurateblockplacement.hmod
+          if-no-files-found: error
+          retention-days: 30
