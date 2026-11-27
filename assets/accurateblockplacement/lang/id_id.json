@@ -1,1 +1,27 @@
- 
+{
+  "key.category.accurateblockplacement.category": "Accurate Block Placement",
+  "net.clayborn.accurateblockplacement.togglevanillaplacement": "Ubah Mode Penempatan",
+  "net.clayborn.accurateblockplacement.modplacementmodemessage": "§7Accurate Block Placement: §aAktif",
+  "net.clayborn.accurateblockplacement.vanillaplacementmodemessage": "§7Accurate Block Placement: §cNonaktif",
+  "net.clayborn.accurateblockplacement.togglefastbreaking": "Ubah Mode Penghancuran Cepat",
+  "net.clayborn.accurateblockplacement.fastbreakingenabled": "§7Fast Block Breaking: §aAktif",
+  "net.clayborn.accurateblockplacement.fastbreakingdisabled": "§7Fast Block Breaking: §cNonaktif",
+  "text.autoconfig.accurateblockplacement.title": "Accurate Block Placement",
+  "text.autoconfig.accurateblockplacement.option.accuratePlacementEnabled": "Aktifkan Accurate Block Placement",
+  "text.autoconfig.accurateblockplacement.option.fastBreakingEnabled": "Aktifkan Fast Block Breaking",
+  "text.autoconfig.accurateblockplacement.option.confirmation": "Konfirmasi saat Toggle",
+  "text.autoconfig.accurateblockplacement.option.confirmationType": "Tipe Konfirmasi",
+  "text.autoconfig.accurateblockplacement.option.confirmationType.CHAT": "Chat",
+  "text.autoconfig.accurateblockplacement.option.confirmationType.HUD": "HUD",
+  "text.autoconfig.accurateblockplacement.section.itemGroups": "Aktifkan penempatan/penggunaan akurat untuk item lain:",
+  "text.autoconfig.accurateblockplacement.option.toolsEnabled": "Peralatan (Tools)",
+  "text.autoconfig.accurateblockplacement.option.toolsEnabled.tooltip": "Gunakan peralatan secara akurat?",
+  "text.autoconfig.accurateblockplacement.option.bucketEnabled": "Ember (Buckets)",
+  "text.autoconfig.accurateblockplacement.option.bucketEnabled.tooltip": "Gunakan ember secara akurat?",
+  "text.autoconfig.accurateblockplacement.option.armorStandEnabled": "Armor Stand",
+  "text.autoconfig.accurateblockplacement.option.armorStandEnabled.tooltip": "Letakkan Armor Stand secara akurat?",
+  "text.autoconfig.accurateblockplacement.option.itemFrameEnabled": "Item Frame",
+  "text.autoconfig.accurateblockplacement.option.itemFrameEnabled.tooltip": "Letakkan Item Frame secara akurat?",
+  "text.autoconfig.accurateblockplacement.option.spawnEggsEnabled": "Spawn Egg",
+  "text.autoconfig.accurateblockplacement.option.spawnEggsEnabled.tooltip": "Gunakan Spawn Egg secara akurat?"
+}
