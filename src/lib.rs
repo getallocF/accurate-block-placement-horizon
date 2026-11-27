@@ -1,555 +1,332 @@
-mod config;
-mod filters;
-mod placement;
-
+use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use horizon_mod_api::prelude::*;
+use serde::{Deserialize, Serialize};
 
-use mod_api::prelude::*;
+const CONFIG_PATH: &str = "config/accurate_block_placement.json";
 
-use crate::config::{AbpConfig, ConfirmationTarget, MOD_ID, SettingKeys};
-use crate::placement::{PickAction, PlacementState, compute_mouse_ratio, offset_pos};
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+enum BlockDirection {
+    Down = 0,
+    Up = 1,
+    North = 2,
+    South = 3,
+    West = 4,
+    East = 5,
+}
 
-const KEY_CATEGORY: &str = "key.category.accurateblockplacement.category";
-const KEY_ID_TOGGLE_PLACEMENT: &str = "togglevanillaplacement";
-const KEY_ID_TOGGLE_FAST_BREAK: &str = "togglefastbreaking";
+impl BlockDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Down => "DOWN",
+            Self::Up => "UP",
+            Self::North => "NORTH",
+            Self::South => "SOUTH",
+            Self::West => "WEST",
+            Self::East => "EAST",
+        }
+    }
 
-const LABEL_TOGGLE_PLACEMENT: &str = "net.clayborn.accurateblockplacement.togglevanillaplacement";
-const LABEL_TOGGLE_FAST_BREAK: &str = "net.clayborn.accurateblockplacement.togglefastbreaking";
+    fn opposite(self) -> Self {
+        match self {
+            Self::Down => Self::Up,
+            Self::Up => Self::Down,
+            Self::North => Self::South,
+            Self::South => Self::North,
+            Self::West => Self::East,
+            Self::East => Self::West,
+        }
+    }
 
-const MSG_PLACEMENT_ENABLED: &str = "net.clayborn.accurateblockplacement.modplacementmodemessage";
-const MSG_PLACEMENT_DISABLED: &str =
-    "net.clayborn.accurateblockplacement.vanillaplacementmodemessage";
-const MSG_FAST_BREAK_ENABLED: &str = "net.clayborn.accurateblockplacement.fastbreakingenabled";
-const MSG_FAST_BREAK_DISABLED: &str = "net.clayborn.accurateblockplacement.fastbreakingdisabled";
+    fn from_name(input: &str) -> Option<Self> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "down" | "bawah" | "0" => Some(Self::Down),
+            "up" | "atas" | "1" => Some(Self::Up),
+            "north" | "utara" | "2" => Some(Self::North),
+            "south" | "selatan" | "3" => Some(Self::South),
+            "west" | "barat" | "4" => Some(Self::West),
+            "east" | "timur" | "5" => Some(Self::East),
+            _ => None,
+        }
+    }
+}
 
-#[derive(Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct AbpConfig {
+    enabled: bool,
+    fast_place: bool,
+    prevent_double_place: bool,
+    carpet_protocol: bool,
+    reverse_facing: bool,
+}
+
+impl Default for AbpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fast_place: true,
+            prevent_double_place: true,
+            carpet_protocol: true,
+            reverse_facing: false,
+        }
+    }
+}
+
+impl AbpConfig {
+    fn load() -> Self {
+        let path = PathBuf::from(CONFIG_PATH);
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(parsed) = serde_json::from_str::<Self>(&raw) {
+                return parsed;
+            }
+        }
+        let default_cfg = Self::default();
+        default_cfg.save();
+        default_cfg
+    }
+
+    fn save(&self) {
+        let path = PathBuf::from(CONFIG_PATH);
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(serialized) = serde_json::to_string_pretty(self) {
+            let _ = fs::write(path, serialized);
+        }
+    }
+}
+
 struct ModState {
     config: AbpConfig,
-    setting_keys: SettingKeys,
-    settings_synced: bool,
-    config_dir: Option<PathBuf>,
-    loaded_local_config: bool,
-    use_key: Option<VanillaKeyMappingRef>,
-    attack_key: Option<VanillaKeyMappingRef>,
-    toggle_placement_key: Option<ModKeyMappingRef>,
-    toggle_fast_break_key: Option<ModKeyMappingRef>,
-    placement: PlacementState,
+    locked_direction: Option<BlockDirection>,
+    last_placed_pos: Option<[i32; 3]>,
+    last_placed_tick: u64,
+    current_tick: u64,
 }
 
-#[derive(Default)]
-pub struct AccurateBlockPlacementMod {
-    state: Mutex<ModState>,
-}
-
-impl AccurateBlockPlacementMod {
-    #[inline]
-    fn with_state<R>(&self, f: impl FnOnce(&mut ModState) -> R) -> R {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&mut guard)
-    }
-
-    fn send_confirmation_message(
-        host: &mut dyn ClientHost,
-        cfg: &AbpConfig,
-        translation_key: &'static str,
-    ) {
-        if !cfg.confirmation {
-            return;
-        }
-        let message = Text::translate(translation_key, Vec::new());
-        match cfg.confirmation_type {
-            ConfirmationTarget::Hud => {
-                let _ = host.set_overlay_message(message, false);
-            }
-            ConfirmationTarget::Chat => {
-                let _ = host.chat_line(message);
-            }
-        }
-    }
-
-    fn check_and_confirm_pending_placement(&self, host: &dyn ClientHost) {
-        let pending_pos = self.with_state(|st| st.placement.pending_placement.map(|p| p.target_pos));
-        let Some(target_pos) = pending_pos else {
-            return;
-        };
-
-        let current_block = host
-            .local_player()
-            .and_then(|player| player.level(host))
-            .and_then(|level| level.block_state(host, [target_pos.x, target_pos.y, target_pos.z]))
-            .map(|state| state.block());
-
-        self.with_state(|st| st.placement.confirm_pending_placement(current_block));
-    }
-
-    fn resolve_active_hand_item(
-        host: &dyn ClientHost,
-        living: LivingRef,
-        cfg: &AbpConfig,
-    ) -> Option<(Hand, ItemKey)> {
-        for hand in Hand::BOTH {
-            if let Some(item) = living.with_hand_item(host, hand, |stack| stack.item())
-                && filters::is_item_allowed(host, item, cfg)
-            {
-                return Some((hand, item));
-            }
-        }
-        None
-    }
-
-    fn other_hand(hand: Hand) -> Hand {
-        match hand {
-            Hand::Main => Hand::Off,
-            Hand::Off => Hand::Main,
+impl ModState {
+    fn new() -> Self {
+        Self {
+            config: AbpConfig::load(),
+            locked_direction: None,
+            last_placed_pos: None,
+            last_placed_tick: 0,
+            current_tick: 0,
         }
     }
 }
 
-#[mod_api::horizon_mod]
-impl Hooks for AccurateBlockPlacementMod {
-    fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
-        let keys = SettingKeys::register_all(r);
+static STATE: OnceLock<Mutex<ModState>> = OnceLock::new();
 
-        r.register_key_mapping(
-            KeyRegistration::new(KEY_ID_TOGGLE_PLACEMENT, "key.keyboard.unknown")
-                .label(LABEL_TOGGLE_PLACEMENT)
-                .category(KEY_CATEGORY)
-                .context(KeyConflictContext::InGame),
-        );
+fn state() -> &'static Mutex<ModState> {
+    STATE.get_or_init(|| Mutex::new(ModState::new()))
+}
 
-        r.register_key_mapping(
-            KeyRegistration::new(KEY_ID_TOGGLE_FAST_BREAK, "key.keyboard.unknown")
-                .label(LABEL_TOGGLE_FAST_BREAK)
-                .category(KEY_CATEGORY)
-                .context(KeyConflictContext::InGame),
-        );
-
-        self.with_state(|st| {
-            st.setting_keys = keys;
-        });
+/// Menghitung arah hadap blok berdasarkan sudut yaw & pitch kamera pemain
+fn direction_from_look(yaw: f32, pitch: f32) -> BlockDirection {
+    if pitch < -45.0 {
+        return BlockDirection::Up;
     }
-
-    fn client_setup(&self, context: &mut dyn ClientSetupContext, _event: &mut ClientSetupEvent) {
-        let use_key = context.vanilla_key_mapping("key.use").ok();
-        let attack_key = context.vanilla_key_mapping("key.attack").ok();
-        let toggle_placement_key = context.mod_key_mapping(MOD_ID, KEY_ID_TOGGLE_PLACEMENT).ok();
-        let toggle_fast_break_key = context
-            .mod_key_mapping(MOD_ID, KEY_ID_TOGGLE_FAST_BREAK)
-            .ok();
-
-        let config_dir = context.config_dir().to_path_buf();
-        let loaded_local = AbpConfig::load_from_config_dir(&config_dir);
-
-        self.with_state(|st| {
-            st.use_key = use_key;
-            st.attack_key = attack_key;
-            st.toggle_placement_key = toggle_placement_key;
-            st.toggle_fast_break_key = toggle_fast_break_key;
-            st.config_dir = Some(config_dir);
-            if let Some(local_cfg) = loaded_local {
-                st.config = local_cfg;
-                st.loaded_local_config = true;
-            }
-            st.settings_synced = false;
-            st.placement.reset_all();
-        });
+    if pitch > 45.0 {
+        return BlockDirection::Down;
     }
+    let normalized = yaw.rem_euclid(360.0);
+    if !(45.0..315.0).contains(&normalized) {
+        BlockDirection::South
+    } else if normalized < 135.0 {
+        BlockDirection::West
+    } else if normalized < 225.0 {
+        BlockDirection::North
+    } else {
+        BlockDirection::East
+    }
+}
 
-    fn setting_changed(&self, _host: &dyn Host, event: &mut SettingChangedEvent<'_>) {
-        if event.mod_id != MOD_ID {
-            return;
+fn toggle_mod(client: &mut ClientContext) {
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+    st.config.enabled = !st.config.enabled;
+    st.last_placed_pos = None;
+    st.config.save();
+
+    let msg = if st.config.enabled {
+        "§aAccurate Block Placement: ON"
+    } else {
+        "§cAccurate Block Placement: OFF"
+    };
+    client.send_actionbar(msg);
+}
+
+fn toggle_fast_place(client: &mut ClientContext) {
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+    st.config.fast_place = !st.config.fast_place;
+    st.config.save();
+
+    let msg = if st.config.fast_place {
+        "§aFast Place (0 Cooldown): ON"
+    } else {
+        "§cFast Place (0 Cooldown): OFF"
+    };
+    client.send_actionbar(msg);
+}
+
+fn toggle_reverse(client: &mut ClientContext) {
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+    st.config.reverse_facing = !st.config.reverse_facing;
+    st.config.save();
+
+    let msg = if st.config.reverse_facing {
+        "§dReverse Block Facing: ON"
+    } else {
+        "§7Reverse Block Facing: OFF"
+    };
+    client.send_actionbar(msg);
+}
+
+fn toggle_or_set_lock(client: &mut ClientContext, explicit: Option<Option<BlockDirection>>) {
+    let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+    match explicit {
+        Some(dir_opt) => {
+            st.locked_direction = dir_opt;
         }
-
-        let to_save = self.with_state(|st| {
-            let changed = st.config.apply_setting_change(event.key, &event.value);
-            if !st.config.accurate_placement_enabled {
-                st.placement.reset_all();
-            }
-            if changed {
-                st.config_dir.clone().map(|dir| (dir, st.config.clone()))
+        None => {
+            if st.locked_direction.is_some() {
+                st.locked_direction = None;
             } else {
-                None
-            }
-        });
-
-        if let Some((dir, cfg)) = to_save {
-            cfg.save_to_config_dir(&dir);
-        }
-    }
-
-    fn key_mapping_pre(
-        &self,
-        host: &mut dyn ClientHost,
-        event: &mut KeyMappingPreEvent<'_>,
-    ) -> Flow {
-        if event.mapping != "key.use" {
-            return Flow::Continue;
-        }
-
-        let mouse_ratio = compute_mouse_ratio(host.cursor(), host.window_size());
-        self.with_state(|st| {
-            if !st.config.accurate_placement_enabled {
-                return;
-            }
-            if event.pressed {
-                st.placement.mark_fresh_use_press(mouse_ratio);
-            } else {
-                st.placement.mark_use_released();
-            }
-        });
-
-        Flow::Continue
-    }
-
-    fn client_pick(&self, host: &mut dyn ClientHost, event: &mut ClientPickEvent<'_>) {
-        // Konfirmasi apakah penempatan dari tick sebelumnya benar-benar mengubah blok di dunia.
-        self.check_and_confirm_pending_placement(&*host);
-
-        let (cfg, use_key) = self.with_state(|st| (st.config.clone(), st.use_key));
-
-        if !cfg.accurate_placement_enabled || !host.playing() {
-            self.with_state(|st| st.placement.reset_all());
-            return;
-        }
-
-        // Jika pemain sedang menggunakan item aktif (makan, tarik busur, perisai, dll.), biarkan vanilla.
-        if host.local_item_use().is_some() {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        let Some(player) = host.local_player() else {
-            self.with_state(|st| st.placement.reset_all());
-            return;
-        };
-
-        let entity = player.entity();
-        let Some(living) = host.living(entity) else {
-            self.with_state(|st| st.placement.reset_all());
-            return;
-        };
-
-        // Hanya aktif jika crosshair mengenai blok.
-        let current_target = *event.result;
-        let Some(hit_target @ CrosshairTarget::Block { pos: hit_pos, state: hit_state, hit }) =
-            current_target
-        else {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        };
-
-        // Cari tangan pertama (Main lalu Off) yang memegang item yang diizinkan.
-        let Some((active_hand, active_item)) = Self::resolve_active_hand_item(&*host, living, &cfg)
-        else {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        };
-
-        let active_item_id = host.item_key_id(active_item).unwrap_or("");
-        let hit_block_id = host.block_key_id(hit_state.block()).unwrap_or("");
-        let is_sneaking = entity.is_shift_key_down(&*host).unwrap_or(false);
-
-        let use_key_down = use_key
-            .and_then(|k| k.is_down(&*host).ok())
-            .unwrap_or(false);
-        let fresh_press_pending = self.with_state(|st| st.placement.fresh_use_press_pending);
-
-        // 1. Jika item di tangan lain memiliki override `use` dan sedang digunakan, lewati.
-        let other_hand = Self::other_hand(active_hand);
-        if let Some(other_item) = living.with_hand_item(&*host, other_hand, |stack| stack.item()) {
-            let other_id = host.item_key_id(other_item).unwrap_or("");
-            if !filters::is_item_allowed(&*host, other_item, &cfg)
-                && filters::does_item_have_overridden_use(other_id)
-                && host.local_item_use().is_some()
-            {
-                self.with_state(|st| {
-                    st.placement.disable_normal_item_use = false;
-                });
-                return;
-            }
-        }
-
-        // 2. Blok aktivabel (pintu, tombol, tuas, meja kerja, dll.) kecuali tangga & kecuali sneak.
-        if filters::is_activatable_block(hit_block_id)
-            && !filters::is_stair_block(hit_block_id)
-            && !is_sneaking
-        {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        // 3. Container / BaseEntityBlock & Bed saat tombol klik kanan ditahan (bukan klik segar).
-        if filters::is_storage_or_bed_block(hit_block_id) && !fresh_press_pending && use_key_down {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        // 4. Scaffolding ke scaffolding tetap menggunakan mekanik tumpuk vanilla.
-        if filters::is_scaffolding(active_item_id) && filters::is_scaffolding(hit_block_id) {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        // 5. Composter + item kompos tetap menggunakan vanilla.
-        if filters::is_composter_block(hit_block_id) && filters::is_compostable_item(active_item_id)
-        {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        // 6. Bone meal di tangan utama ke blok bonemealable tetap menggunakan vanilla.
-        if active_hand == Hand::Main
-            && filters::is_bone_meal_item(active_item_id)
-            && filters::is_bonemealable_block(hit_block_id)
-        {
-            self.with_state(|st| {
-                st.placement.disable_normal_item_use = false;
-            });
-            return;
-        }
-
-        let Some(player_pos) = entity.position(&*host) else {
-            return;
-        };
-
-        let target_placement_pos = if filters::is_replaceable_block(hit_block_id) {
-            hit_pos
-        } else {
-            offset_pos(hit_pos, hit.face)
-        };
-
-        let old_target_block = player
-            .level(&*host)
-            .and_then(|level| {
-                level.block_state(
-                    &*host,
-                    [
-                        target_placement_pos.x,
-                        target_placement_pos.y,
-                        target_placement_pos.z,
-                    ],
-                )
-            })
-            .map(|state| state.block())
-            .unwrap_or_else(|| hit_state.block());
-
-        let right_click_delay = host.right_click_delay().unwrap_or(0);
-        let current_mouse_ratio = compute_mouse_ratio(host.cursor(), host.window_size());
-
-        let action = self.with_state(|st| {
-            st.placement.evaluate_pick(
-                hit_target,
-                hit_pos,
-                hit.face,
-                target_placement_pos,
-                old_target_block,
-                player_pos,
-                use_key_down,
-                right_click_delay,
-                current_mouse_ratio,
-            )
-        });
-
-        match action {
-            PickAction::AllowVanilla | PickAction::SuppressNoAction => {}
-            PickAction::TriggerPlacement {
-                override_target,
-                reset_right_click_delay,
-            } => {
-                if let Some(target) = override_target {
-                    *event.result = Some(target);
-                }
-                if reset_right_click_delay {
-                    let _ = host.set_right_click_delay(0);
-                }
-                if let Some(key) = use_key {
-                    self.with_state(|st| {
-                        st.placement.allow_injected_use_click = true;
-                    });
-                    let _ = key.click(host);
-                }
+                let dir = direction_from_look(client.player_yaw(), client.player_pitch());
+                st.locked_direction = Some(dir);
             }
         }
     }
 
-    fn interaction_key_mapping_triggered(
-        &self,
-        _host: &mut dyn ClientHost,
-        event: &mut InteractionKeyMappingTriggeredEvent,
-    ) -> Flow {
-        if event.key != InteractionKey::Use {
-            return Flow::Continue;
-        }
-
-        let should_cancel = self.with_state(|st| {
-            if !st.config.accurate_placement_enabled || !st.placement.disable_normal_item_use {
-                return false;
-            }
-            if st.placement.allow_injected_use_click {
-                // Izinkan satu rangkaian klik hasil injeksi ABP (Main/Off hand pada tick ini).
-                if event.hand == Hand::Off {
-                    st.placement.allow_injected_use_click = false;
-                }
-                return false;
-            }
-            true
-        });
-
-        if should_cancel {
-            event.swing_hand = false;
-            Flow::Cancel
-        } else {
-            Flow::Continue
-        }
+    match st.locked_direction {
+        Some(dir) => client.send_actionbar(&format!("§bRotation Lock: {}", dir.as_str())),
+        None => client.send_actionbar("§eRotation Lock: OFF"),
     }
+}
 
-    fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
-        // 1. Sinkronisasi awal setting Horizon <-> file lokal `config/accurateblockplacement.toml`.
-        let (needs_sync, keys, loaded_local, local_cfg, config_dir) = self.with_state(|st| {
-            (
-                !st.settings_synced,
-                st.setting_keys.clone(),
-                st.loaded_local_config,
-                st.config.clone(),
-                st.config_dir.clone(),
-            )
-        });
+#[horizon_mod_main]
+pub fn init(ctx: &mut ModContext) {
+    // 1. Keybind Desktop / External Keyboard
+    ctx.register_keybind("key.accurate_block_placement.toggle", KeyCode::KeyR, |client| {
+        toggle_mod(client);
+    });
 
-        if needs_sync {
-            if loaded_local {
-                local_cfg.push_all_to_host(&keys, host);
-            }
-            let synced_cfg = self.with_state(|st| {
-                st.config.sync_from_host(&st.setting_keys, &*host);
-                st.settings_synced = true;
-                st.config.clone()
-            });
-            if let Some(dir) = config_dir {
-                synced_cfg.save_to_config_dir(&dir);
-            }
-        }
+    ctx.register_keybind("key.accurate_block_placement.lock", KeyCode::KeyG, |client| {
+        toggle_or_set_lock(client, None);
+    });
 
-        // Bersihkan flag klik terinjeksi di akhir tick jika tangan off-hand tidak pernah dipanggil.
-        self.with_state(|st| {
-            st.placement.allow_injected_use_click = false;
-        });
+    ctx.register_keybind("key.accurate_block_placement.reverse", KeyCode::KeyV, |client| {
+        toggle_reverse(client);
+    });
 
-        // 2. Konfirmasi blok yang baru saja diletakkan pada tick ini.
-        self.check_and_confirm_pending_placement(&*host);
+    ctx.register_keybind("key.accurate_block_placement.fastplace", KeyCode::KeyB, |client| {
+        toggle_fast_place(client);
+    });
 
-        // 3. Tangani keybind Toggle Accurate Block Placement & Toggle Fast Block Breaking.
-        let (toggle_place_key, toggle_break_key, attack_key) = self.with_state(|st| {
-            (
-                st.toggle_placement_key,
-                st.toggle_fast_break_key,
-                st.attack_key,
-            )
-        });
-
-        if let Some(key) = toggle_place_key {
-            while key.consume_click(host).unwrap_or(false) {
-                let (new_val, setting_key, cfg_snapshot, dir_opt) = self.with_state(|st| {
-                    st.config.accurate_placement_enabled = !st.config.accurate_placement_enabled;
-                    if !st.config.accurate_placement_enabled {
-                        st.placement.reset_all();
+    // 2. Client Command /abp (Ramah Layar Sentuh Horizon Android)
+    ctx.register_client_command("abp", |client, args| {
+        let sub = args.first().map(|s| s.to_ascii_lowercase());
+        match sub.as_deref() {
+            None | Some("toggle") => toggle_mod(client),
+            Some("fast") | Some("fastplace") => toggle_fast_place(client),
+            Some("reverse") | Some("rev") => toggle_reverse(client),
+            Some("lock") => {
+                if let Some(arg_dir) = args.get(1) {
+                    if arg_dir.eq_ignore_ascii_case("off") || arg_dir.eq_ignore_ascii_case("unlock") {
+                        toggle_or_set_lock(client, Some(None));
+                    } else if let Some(parsed_dir) = BlockDirection::from_name(arg_dir) {
+                        toggle_or_set_lock(client, Some(Some(parsed_dir)));
+                    } else {
+                        client.send_chat("§cArah tidak valid. Gunakan: north, south, east, west, up, down, atau off");
                     }
-                    (
-                        st.config.accurate_placement_enabled,
-                        st.setting_keys.accurate_place,
-                        st.config.clone(),
-                        st.config_dir.clone(),
-                    )
-                });
-
-                if let Some(sk) = setting_key {
-                    let _ = host.set_setting(sk, SettingValue::Toggle(new_val));
-                }
-                if let Some(dir) = dir_opt {
-                    cfg_snapshot.save_to_config_dir(&dir);
-                }
-
-                let msg_key = if new_val {
-                    MSG_PLACEMENT_ENABLED
                 } else {
-                    MSG_PLACEMENT_DISABLED
-                };
-                Self::send_confirmation_message(host, &cfg_snapshot, msg_key);
+                    toggle_or_set_lock(client, None);
+                }
+            }
+            Some("status") | Some("info") => {
+                let st = state().lock().unwrap_or_else(|e| e.into_inner());
+                let lock_str = st
+                    .locked_direction
+                    .map(|d| d.as_str())
+                    .unwrap_or("OFF");
+                client.send_chat(&format!(
+                    "§6[ABP] §fMod: {} §7| §fFastPlace: {} §7| §fReverse: {} §7| §fLock: §b{}",
+                    if st.config.enabled { "§aON" } else { "§cOFF" },
+                    if st.config.fast_place { "§aON" } else { "§cOFF" },
+                    if st.config.reverse_facing { "§dON" } else { "§7OFF" },
+                    lock_str
+                ));
+            }
+            _ => {
+                client.send_chat("§ePenggunaan: /abp <toggle|fast|lock [arah|off]|reverse|status>");
             }
         }
+    });
 
-        if let Some(key) = toggle_break_key {
-            while key.consume_click(host).unwrap_or(false) {
-                let (new_val, setting_key, cfg_snapshot, dir_opt) = self.with_state(|st| {
-                    st.config.fast_breaking_enabled = !st.config.fast_breaking_enabled;
-                    (
-                        st.config.fast_breaking_enabled,
-                        st.setting_keys.fast_break,
-                        st.config.clone(),
-                        st.config_dir.clone(),
-                    )
-                });
+    // 3. Client Tick: Hilangkan cooldown klik kanan saat memegang blok (Fast Place)
+    ctx.on_client_tick(|client| {
+        let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+        st.current_tick = st.current_tick.wrapping_add(1);
 
-                if let Some(sk) = setting_key {
-                    let _ = host.set_setting(sk, SettingValue::Toggle(new_val));
-                }
-                if let Some(dir) = dir_opt {
-                    cfg_snapshot.save_to_config_dir(&dir);
-                }
-
-                let msg_key = if new_val {
-                    MSG_FAST_BREAK_ENABLED
-                } else {
-                    MSG_FAST_BREAK_DISABLED
-                };
-                Self::send_confirmation_message(host, &cfg_snapshot, msg_key);
-            }
+        if !st.config.enabled {
+            return;
         }
 
-        // 4. Fast Block Breaking: saat tombol attack ditahan ke blok dan `mining_destroy_delay() > 0`,
-        // picu klik attack segar agar tidak menunggu jeda 5 tick vanilla.
-        let fast_break_on = self.with_state(|st| st.config.fast_breaking_enabled);
-        if fast_break_on
-            && host.playing()
-            && host.mining_destroy_delay() > 0
-            && matches!(host.crosshair_target(), Some(CrosshairTarget::Block { .. }))
-            && let Some(atk) = attack_key
-            && atk.physical_down(&*host).unwrap_or(false)
+        if st.config.fast_place && client.is_holding_block() && client.item_use_cooldown() > 0 {
+            client.set_item_use_cooldown(0);
+        }
+
+        // Reset riwayat posisi saat tombol klik kanan / pasang blok dilepas
+        if !client.is_use_key_pressed() {
+            st.last_placed_pos = None;
+        }
+    });
+
+    // 4. Intercept Block Placement: Anti-Double-Place & Carpet Accurate Block Placement Protocol
+    ctx.on_block_place(|event| {
+        let mut st = state().lock().unwrap_or_else(|e| e.into_inner());
+        if !st.config.enabled {
+            return;
+        }
+
+        let target_pos = event.target_block_pos();
+
+        // Cegah blok bertumpuk 2x di titik identik dalam rentang 2 tick saat menahan tombol pasang
+        if st.config.prevent_double_place
+            && st.last_placed_pos == Some(target_pos)
+            && st.current_tick.saturating_sub(st.last_placed_tick) <= 2
         {
-            let _ = atk.click(host);
+            event.cancel();
+            return;
         }
-    }
 
-    fn client_level_unload(
-        &self,
-        _host: &mut dyn ClientHost,
-        _event: &mut ClientLevelUnloadEvent<'_>,
-    ) {
-        self.with_state(|st| st.placement.reset_all());
-    }
+        st.last_placed_pos = Some(target_pos);
+        st.last_placed_tick = st.current_tick;
 
-    fn client_player_logging_out(
-        &self,
-        _host: &mut dyn ClientHost,
-        _event: &mut ClientPlayerLoggingOutEvent,
-    ) {
-        self.with_state(|st| st.placement.reset_all());
-    }
+        if !st.config.carpet_protocol {
+            return;
+        }
+
+        // Tentukan arah blok (prioritas: Rotation Lock -> Reverse Facing)
+        let resolved_dir = match st.locked_direction {
+            Some(locked) => Some(if st.config.reverse_facing {
+                locked.opposite()
+            } else {
+                locked
+            }),
+            None if st.config.reverse_facing => {
+                Some(direction_from_look(event.player_yaw(), event.player_pitch()).opposite())
+            }
+            None => None,
+        };
+
+        if let Some(dir) = resolved_dir {
+            // Encoding Carpet Protocol pada koordinat hit_x: block_x + 2.0 + (dir_id * 2.0)
+            let carpet_hit_x = (target_pos[0] as f64) + 2.0 + ((dir as u8 as f64) * 2.0);
+            event.set_hit_x(carpet_hit_x);
+        }
+    });
 }
